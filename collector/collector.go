@@ -16,6 +16,7 @@ package collector
 import (
 	"fmt"
 	"os"
+	"os/user"
 	"reflect"
 	"strconv"
 	"strings"
@@ -135,8 +136,8 @@ func NewExporter(paths []string, logger log.Logger, cgroupv2 bool) *Exporter {
 			"Swap fail count", []string{"cgroup"}, nil),
 		info: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "info"),
 			"User slice information", []string{"cgroup", "username", "uid", "jobid"}, nil),
-		processExec: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_exec_count"),
-			"Count of instances of a given process", []string{"cgroup", "exec"}, nil),
+	processExec: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_exec_count"),
+			"Count of instances of a given process", []string{"cgroup", "exec", "username", "uid"}, nil),
 		collectError: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "exporter", "collect_error"),
 			"Indicates collection error, 0=no error, 1=error", []string{"cgroup"}, nil),
 		logger:   logger,
@@ -197,7 +198,7 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		}
 		if *collectProc {
 			for exec, count := range m.processExec {
-				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, exec)
+				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, exec, m.username, m.uid)
 			}
 		}
 	}
@@ -205,6 +206,11 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 
 func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
 	executables := make(map[string]float64)
+	var uidCounts map[uint64]int
+	collectUser := metric.uid == "" && metric.username == ""
+	if collectUser {
+		uidCounts = make(map[uint64]int)
+	}
 	procFS, err := procfs.NewFS(*ProcRoot)
 	if err != nil {
 		level.Error(logger).Log("msg", "Unable to open procfs", "path", *ProcRoot)
@@ -226,6 +232,16 @@ func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
 				wg.Done()
 				return
 			}
+			if collectUser {
+				status, err := proc.NewStatus()
+				if err != nil {
+					level.Error(logger).Log("msg", "Unable to get status for PID", "pid", p)
+				} else {
+					metricLock.Lock()
+					uidCounts[status.UIDs[0]]++
+					metricLock.Unlock()
+				}
+			}
 			if len(executable) > *collectProcMaxExec {
 				level.Debug(logger).Log("msg", "Executable will be truncated", "executable", executable, "len", len(executable), "pid", p)
 				trim := *collectProcMaxExec / 2
@@ -241,6 +257,25 @@ func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
 	}
 	wg.Wait()
 	metric.processExec = executables
+	if collectUser && len(uidCounts) > 0 {
+		var (
+			maxUID   uint64
+			maxCount int
+		)
+		for uid, count := range uidCounts {
+			if count > maxCount {
+				maxUID = uid
+				maxCount = count
+			}
+		}
+		metric.uid = strconv.FormatUint(maxUID, 10)
+		userInfo, err := user.LookupId(metric.uid)
+		if err != nil {
+			level.Error(logger).Log("msg", "Error looking up process uid", "uid", metric.uid, "err", err)
+		} else {
+			metric.username = userInfo.Username
+		}
+	}
 }
 
 func parseCpuSet(cpuset string) ([]string, error) {
