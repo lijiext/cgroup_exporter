@@ -91,8 +91,14 @@ type CgroupMetric struct {
 	uid             string
 	username        string
 	jobid           string
-	processExec     map[string]float64
+	processExec     map[processExecKey]float64
 	err             bool
+}
+
+type processExecKey struct {
+	exec     string
+	username string
+	uid      string
 }
 
 func NewCgroupCollector(cgroupV2 bool, paths []string, logger log.Logger) Collector {
@@ -136,7 +142,7 @@ func NewExporter(paths []string, logger log.Logger, cgroupv2 bool) *Exporter {
 			"Swap fail count", []string{"cgroup"}, nil),
 		info: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "info"),
 			"User slice information", []string{"cgroup", "username", "uid", "jobid"}, nil),
-	processExec: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_exec_count"),
+		processExec: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "", "process_exec_count"),
 			"Count of instances of a given process", []string{"cgroup", "exec", "username", "uid"}, nil),
 		collectError: prometheus.NewDesc(prometheus.BuildFQName(Namespace, "exporter", "collect_error"),
 			"Indicates collection error, 0=no error, 1=error", []string{"cgroup"}, nil),
@@ -197,20 +203,16 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(e.info, prometheus.GaugeValue, 1, m.name, m.username, m.uid, m.jobid)
 		}
 		if *collectProc {
-			for exec, count := range m.processExec {
-				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, exec, m.username, m.uid)
+			for key, count := range m.processExec {
+				ch <- prometheus.MustNewConstMetric(e.processExec, prometheus.GaugeValue, count, m.name, key.exec, key.username, key.uid)
 			}
 		}
 	}
 }
 
 func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
-	executables := make(map[string]float64)
-	var uidCounts map[uint64]int
-	collectUser := metric.uid == "" && metric.username == ""
-	if collectUser {
-		uidCounts = make(map[uint64]int)
-	}
+	executables := make(map[processExecKey]float64)
+	userCache := make(map[uint64]string)
 	procFS, err := procfs.NewFS(*ProcRoot)
 	if err != nil {
 		level.Error(logger).Log("msg", "Unable to open procfs", "path", *ProcRoot)
@@ -232,13 +234,30 @@ func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
 				wg.Done()
 				return
 			}
-			if collectUser {
-				status, err := proc.NewStatus()
-				if err != nil {
-					level.Error(logger).Log("msg", "Unable to get status for PID", "pid", p)
+			var (
+				uidStr   string
+				username string
+			)
+			status, err := proc.NewStatus()
+			if err != nil {
+				level.Error(logger).Log("msg", "Unable to get status for PID", "pid", p)
+			} else if len(status.UIDs) > 0 {
+				uid := status.UIDs[0]
+				uidStr = strconv.FormatUint(uid, 10)
+				metricLock.Lock()
+				cached, ok := userCache[uid]
+				metricLock.Unlock()
+				if ok {
+					username = cached
 				} else {
+					userInfo, err := user.LookupId(uidStr)
+					if err != nil {
+						level.Error(logger).Log("msg", "Error looking up process uid", "uid", uidStr, "err", err)
+					} else {
+						username = userInfo.Username
+					}
 					metricLock.Lock()
-					uidCounts[status.UIDs[0]]++
+					userCache[uid] = username
 					metricLock.Unlock()
 				}
 			}
@@ -250,32 +269,13 @@ func getProcInfo(pids []int, metric *CgroupMetric, logger log.Logger) {
 				executable = fmt.Sprintf("%s...%s", executable_prefix, executable_suffix)
 			}
 			metricLock.Lock()
-			executables[executable] += 1
+			executables[processExecKey{exec: executable, username: username, uid: uidStr}] += 1
 			metricLock.Unlock()
 			wg.Done()
 		}(pid)
 	}
 	wg.Wait()
 	metric.processExec = executables
-	if collectUser && len(uidCounts) > 0 {
-		var (
-			maxUID   uint64
-			maxCount int
-		)
-		for uid, count := range uidCounts {
-			if count > maxCount {
-				maxUID = uid
-				maxCount = count
-			}
-		}
-		metric.uid = strconv.FormatUint(maxUID, 10)
-		userInfo, err := user.LookupId(metric.uid)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error looking up process uid", "uid", metric.uid, "err", err)
-		} else {
-			metric.username = userInfo.Username
-		}
-	}
 }
 
 func parseCpuSet(cpuset string) ([]string, error) {

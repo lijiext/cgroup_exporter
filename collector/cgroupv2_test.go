@@ -208,7 +208,7 @@ func TestCollectv2SLURM(t *testing.T) {
 	if val := m.jobid; val != "4" {
 		t.Errorf("Unexpected value for jobid, got %v", val)
 	}
-	if val, ok := m.processExec["/usr/bin/bash"]; !ok {
+	if val := processExecCount(m.processExec, "/usr/bin/bash", "20821"); val == 0 {
 		t.Errorf("processExec does not contain /bin/bash")
 	} else {
 		if val != 1 {

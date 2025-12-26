@@ -64,7 +64,7 @@ func TestGetProcInfo(t *testing.T) {
 	w := log.NewSyncWriter(os.Stderr)
 	logger := log.NewLogfmtLogger(w)
 	getProcInfo([]int{95521, 95525}, &metric, logger)
-	if val, ok := metric.processExec["/bin/bash"]; !ok {
+	if val := processExecCount(metric.processExec, "/bin/bash", ""); val == 0 {
 		t.Errorf("Process /bin/bash not in metrics")
 		return
 	} else {
@@ -75,7 +75,7 @@ func TestGetProcInfo(t *testing.T) {
 	varLen := 6
 	collectProcMaxExec = &varLen
 	getProcInfo([]int{95521, 95525}, &metric, logger)
-	if val, ok := metric.processExec["/bi...ash"]; !ok {
+	if val := processExecCount(metric.processExec, "/bi...ash", ""); val == 0 {
 		t.Errorf("Process /bin/bash not in metrics, found: %v", metric.processExec)
 		return
 	} else {
@@ -83,4 +83,14 @@ func TestGetProcInfo(t *testing.T) {
 			t.Errorf("Expected 2 /b...sh processes, got %v", val)
 		}
 	}
+}
+
+func processExecCount(metrics map[processExecKey]float64, exec string, uid string) float64 {
+	var count float64
+	for key, val := range metrics {
+		if key.exec == exec && key.uid == uid {
+			count += val
+		}
+	}
+	return count
 }
